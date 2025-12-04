@@ -1,0 +1,36 @@
+import pandas as pd
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import train_test_split
+import joblib
+
+# 1) Load training data
+df = pd.read_csv("subsidy_fraud_synthetic.csv")
+
+feature_cols = [
+    "LargeOrFrequentDepositsExceedCapacity",
+    "FrequentRegistrationChangesBeforeDisbursement",
+    "RapidTransfersToUnlinkedAccounts",
+    "DeclaredProductionVsSalesMismatch",
+    "MultipleEntitiesSameOwnerOrPremises",
+    "HighSubsidyInLowFarmlandArea",
+    "OverlappingSubsidyClaims",
+    "FictitiousOrManipulatedDocs",
+]
+
+X = df[feature_cols].values
+y = df["RiskLabel"].values
+
+# 2) Split and train
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+model = DecisionTreeClassifier(max_depth=4, random_state=42)
+model.fit(X_train, y_train)
+
+print("Train accuracy:", model.score(X_train, y_train))
+print("Test accuracy:", model.score(X_test, y_test))
+
+# 3) Save model to disk
+joblib.dump(model, "fraud_tree_model.pkl")
+print("Saved model to fraud_tree_model.pkl")
