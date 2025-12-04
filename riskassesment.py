@@ -1,0 +1,164 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+# ---------- CORE RISK FUNCTIONS (same logic as before) ----------
+
+def compute_dealer_season_features(df):
+    df["date"] = pd.to_datetime(df["date"])
+
+    farmer_season = df.groupby(
+        ["dealer_id", "farmer_id", "district", "season"],
+        as_index=False
+    ).agg(
+        total_fert_kg=("fertilizer_qty_kg", "sum"),
+        land_area_acres=("land_area_acres", "max"),
+        visits=("date", "count"),
+        aadhaar_failures=("aadhaar_failures", "sum")
+    )
+    farmer_season["fert_per_acre"] = farmer_season["total_fert_kg"] / farmer_season["land_area_acres"].clip(lower=1e-3)
+
+    dealer_season = farmer_season.groupby(
+        ["dealer_id", "district", "season"],
+        as_index=False
+    ).agg(
+        total_fert_kg=("total_fert_kg", "sum"),
+        total_land_area_acres=("land_area_acres", "sum"),
+        n_farmers=("farmer_id", "nunique"),
+        total_visits=("visits", "sum"),
+        total_aadhaar_failures=("aadhaar_failures", "sum"),
+        avg_fert_per_acre=("fert_per_acre", "mean"),
+        avg_visits_per_farmer=("visits", "mean")
+    )
+    dealer_season["fert_per_acre"] = dealer_season["total_fert_kg"] / dealer_season["total_land_area_acres"].clip(lower=1e-3)
+
+    district_stats = dealer_season.groupby(
+        ["district", "season"],
+        as_index=False
+    ).agg(
+        dist_avg_fert_per_acre=("fert_per_acre", "mean"),
+        dist_std_fert_per_acre=("fert_per_acre", "std"),
+        dist_total_fert_kg=("total_fert_kg", "sum")
+    )
+    district_stats["dist_std_fert_per_acre"] = district_stats["dist_std_fert_per_acre"].fillna(0.0)
+
+    dealer_season = dealer_season.merge(
+        district_stats,
+        on=["district", "season"],
+        how="left"
+    )
+
+    eps = 1e-3
+    dealer_season["z_fert_per_acre"] = (
+        dealer_season["fert_per_acre"] - dealer_season["dist_avg_fert_per_acre"]
+    ) / (dealer_season["dist_std_fert_per_acre"] + eps)
+
+    dist_visits = dealer_season.groupby(["district", "season"], as_index=False).agg(
+        dist_median_visits=("avg_visits_per_farmer", "median")
+    )
+    dealer_season = dealer_season.merge(
+        dist_visits,
+        on=["district", "season"],
+        how="left"
+    )
+    dealer_season["visit_ratio"] = dealer_season["avg_visits_per_farmer"] / dealer_season["dist_median_visits"].clip(lower=1e-3)
+
+    dealer_season["aadhaar_fail_rate"] = dealer_season["total_aadhaar_failures"] / dealer_season["total_visits"].clip(lower=1e-3)
+    dealer_season["district_share"] = dealer_season["total_fert_kg"] / dealer_season["dist_total_fert_kg"].clip(lower=1e-3)
+
+    # end-of-season spike
+    last_month_sales = df.groupby(
+        ["dealer_id", "district", "season"],
+        as_index=False
+    ).apply(lambda g: pd.Series({
+        "last_month_fert_kg": g[g["date"] >= (g["date"].max() - pd.Timedelta(days=30))]["fertilizer_qty_kg"].sum(),
+        "total_fert_kg_check": g["fertilizer_qty_kg"].sum()
+    })).reset_index(drop=True)
+
+    dealer_season = dealer_season.merge(
+        last_month_sales[["dealer_id", "district", "season", "last_month_fert_kg", "total_fert_kg_check"]],
+        on=["dealer_id", "district", "season"],
+        how="left"
+    )
+    dealer_season["last_month_fert_kg"] = dealer_season["last_month_fert_kg"].fillna(0.0)
+    dealer_season["total_fert_kg_check"] = dealer_season["total_fert_kg_check"].fillna(dealer_season["total_fert_kg"])
+    dealer_season["end_season_spike"] = dealer_season["last_month_fert_kg"] / dealer_season["total_fert_kg_check"].clip(lower=1e-3)
+
+    return dealer_season
+
+def compute_risk_score(dealer_season):
+    dealer_season["z_fert_per_acre_clipped"] = dealer_season["z_fert_per_acre"].clip(lower=-3, upper=5)
+    dealer_season["visit_ratio_clipped"] = dealer_season["visit_ratio"].clip(lower=0, upper=5)
+    dealer_season["aadhaar_fail_rate_clipped"] = dealer_season["aadhaar_fail_rate"].clip(lower=0, upper=1)
+    dealer_season["district_share_clipped"] = dealer_season["district_share"].clip(lower=0, upper=1)
+    dealer_season["end_season_spike_clipped"] = dealer_season["end_season_spike"].clip(lower=0, upper=1)
+
+    w_z = 1.0
+    w_visit = 0.7
+    w_fail = 1.2
+    w_share = 1.0
+    w_spike = 1.0
+
+    dealer_season["RiskScore"] = (
+        w_z * dealer_season["z_fert_per_acre_clipped"].clip(lower=0) +
+        w_visit * (dealer_season["visit_ratio_clipped"] - 1.0).clip(lower=0) +
+        w_fail * dealer_season["aadhaar_fail_rate_clipped"] +
+        w_share * (dealer_season["district_share_clipped"] - 0.3).clip(lower=0) +
+        w_spike * (dealer_season["end_season_spike_clipped"] - 0.4).clip(lower=0)
+    )
+
+    def band(score):
+        if score < 1.0:
+            return "GREEN"
+        elif score < 2.5:
+            return "YELLOW"
+        else:
+            return "RED"
+
+    dealer_season["RiskBand"] = dealer_season["RiskScore"].apply(band)
+    return dealer_season
+
+# ---------- STREAMLIT APP ----------
+
+st.title("Subsidy Risk Scoring on Aadhaar–PoS Data")
+
+st.write("Upload a PoS-style CSV with columns: dealer_id, farmer_id, district, season, date, fertilizer_qty_kg, land_area_acres, aadhaar_failures.")
+
+uploaded = st.file_uploader("Upload pos_transactions.csv", type=["csv"])
+
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
+    st.write("Raw data preview:")
+    st.dataframe(df.head())
+
+    required_cols = {
+        "dealer_id","farmer_id","district","season",
+        "date","fertilizer_qty_kg","land_area_acres","aadhaar_failures"
+    }
+    if not required_cols.issubset(set(df.columns)):
+        st.error(f"Missing columns. Required: {required_cols}")
+    else:
+        if st.button("Compute Risk Scores"):
+            dealer_season = compute_dealer_season_features(df)
+            dealer_season = compute_risk_score(dealer_season)
+
+            st.success("Risk scores computed.")
+            st.subheader("Dealer–season risk table")
+            st.dataframe(
+                dealer_season[[
+                    "dealer_id","district","season",
+                    "fert_per_acre","z_fert_per_acre",
+                    "avg_visits_per_farmer","visit_ratio",
+                    "aadhaar_fail_rate","district_share","end_season_spike",
+                    "RiskScore","RiskBand"
+                ]].sort_values("RiskScore", ascending=False)
+            )
+
+            # Simple download
+            csv_out = dealer_season.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download dealer_season_risk_scores.csv",
+                data=csv_out,
+                file_name="dealer_season_risk_scores.csv",
+                mime="text/csv"
+            )
